@@ -1,18 +1,42 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract Supa is Ownable {
-    address public adminAddress; // owner/admin/manager address;
-    address public feesAddress; //  address where fees will be transferred. This fee is used to pay for devs/marketing etc;
-    uint8 feePercent;
-    bool isContractLocked;
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
 
-    constructor(address admin, address fees) {
+    address public adminAddress; // owner/admin/manager address;
+    address payable public feesVault; //  address where fees will be transferred. This fee is used to pay for devs/marketing etc;
+    address payable public investmentVault; // address where user funds after fees will go to. ($10 per share, usdc)
+    address payable public rewardsVault; // address where user rewards will be moved to initially before being claiming.
+
+    address public paymentTokenAddress; // contract address of coins like usdc or whatever we decide the user should buy the shares using.
+
+    uint8 feePercent;
+    bool isContractLocked = true;
+
+    constructor(
+        address admin,
+        address feesAddress,
+        address investmentAddress,
+        address rewardsAddress,
+        address tokenAddress
+    ) {
+        require(
+            admin != feesAddress &&
+                feesAddress != investmentAddress &&
+                investmentAddress != rewardsAddress,
+            "all addreses must be different"
+        );
         adminAddress = admin;
-        feesAddress = fees;
-        isContractLocked = true;
-        feePercent = 5;
+        feesVault = payable(feesAddress);
+        investmentVault = payable(investmentAddress);
+        rewardsVault = payable(rewardsAddress);
+        paymentTokenAddress = tokenAddress;
     }
 
     // accounts which are used to create atlas/strongblock nodes.
@@ -41,10 +65,50 @@ contract Supa is Ownable {
         feePercent = feeNum;
     }
 
-    function _addToInvestmentWallets(address _account) external onlyOwner {
+    function setFeeVault(address feeAddress) external onlyOwner {
+        require(feeAddress != feesVault, "same address provided");
+        require(
+            (feeAddress != investmentVault &&
+                feeAddress != rewardsVault &&
+                feeAddress != adminAddress),
+            "Can't be any of admin, rewards or investment addresses"
+        );
+        feesVault = payable(feeAddress);
+    }
+
+    function setInvestmentVault(address investmentAddress) external onlyOwner {
+        require(investmentAddress != investmentVault, "same address provided");
+        require(
+            (investmentAddress != rewardsVault &&
+                investmentAddress != feesVault &&
+                investmentAddress != adminAddress),
+            "Can't be any of admin, rewards or investment addresses"
+        );
+        investmentVault = payable(investmentAddress);
+    }
+
+    function setRewardsvault(address rewardsAddress) external onlyOwner {
+        require(rewardsVault != rewardsAddress, "same address provided");
+        require(
+            (rewardsAddress != investmentVault &&
+                rewardsAddress != feesVault &&
+                rewardsAddress != adminAddress),
+            "Can't be any of admin, rewards or investment addresses"
+        );
+        rewardsVault = payable(rewardsAddress);
+    }
+
+    function updatePaymentTokenAddress(address _tokenAddress)
+        external
+        onlyOwner
+    {
+        paymentTokenAddress = _tokenAddress;
+    }
+
+    function _updateInvestmentWallets(address _account) external onlyOwner {
         if (
             _account != address(0) &&
-            _account != feesAddress &&
+            _account != feesVault &&
             _account != adminAddress
         ) {
             investmentWallets.push(_account);
@@ -67,7 +131,7 @@ contract Supa is Ownable {
         );
         if (
             _account != address(0) &&
-            _account != feesAddress &&
+            _account != feesVault &&
             _account != adminAddress
         ) {
             suspendedUserAccounts.push(_account);
@@ -155,36 +219,56 @@ contract Supa is Ownable {
             userInvestments[_account][NODE_TYPE.STRONGBLOCK].claimableRewards;
     }
 
+    function getTotalSharesSold() public view returns (uint256) {
+        uint256 totalShares = 0;
+        for (uint256 i = 0; i < allShareHolders.length; i++) {
+            uint256 atlasSharesBought = userInvestments[allShareHolders[i]][
+                NODE_TYPE.ATLAS
+            ].numberOfShares;
+            uint256 strongSharesBought = userInvestments[allShareHolders[i]][
+                NODE_TYPE.STRONGBLOCK
+            ].numberOfShares;
+            totalShares = atlasSharesBought + strongSharesBought;
+        }
+        return totalShares;
+    }
+
     function createInvestment(NODE_TYPE _nodePreference, uint256 _shares)
         external
+        payable
         onlyNonSuspendedUsers
         onlyAtlasOrStrong(_nodePreference)
     {
         require(!isContractLocked, "contract is locked at the moment");
         require(_shares >= 1, "Minimum requirement of 1 share not met..!");
         address _account = msg.sender;
-        if (
+        require(
             _account != address(0) &&
-            _account != feesAddress &&
-            _account != adminAddress
-        ) {
-            Investment storage existingInvestment = userInvestments[_account][
-                _nodePreference
-            ];
+                _account != feesVault &&
+                _account != adminAddress,
+            "only non contract related address allowed"
+        );
 
-            if (existingInvestment.numberOfShares > 0) {
-                userInvestments[_account][_nodePreference]
-                    .numberOfShares += _shares;
-            } else {
-                // Todo: transfer shares
-                // Do Something like IERC20(_token ).safeTransferFrom( msg.sender, address(this), _price.mul( _tenToThePowerDecimals).mul( _shareCount ));
-                userInvestments[_account][_nodePreference] = Investment(
-                    _shares,
-                    block.timestamp,
-                    0 // claimable rewards
-                );
-                allShareHolders.push(_account);
-            }
+        Investment storage existingInvestment = userInvestments[_account][
+            _nodePreference
+        ];
+
+        IERC20(paymentTokenAddress).safeTransferFrom(
+            _account,
+            investmentVault,
+            10 * _shares
+        );
+
+        if (existingInvestment.numberOfShares > 0) {
+            userInvestments[_account][_nodePreference]
+                .numberOfShares += _shares;
+        } else {
+            userInvestments[_account][_nodePreference] = Investment(
+                _shares,
+                block.timestamp,
+                0 // claimable rewards
+            );
+            allShareHolders.push(_account);
         }
     }
 
@@ -208,6 +292,21 @@ contract Supa is Ownable {
         // Todo:  check whether we need to do the below operation. Check during testing.
         userInvestments[_account][_nodePreference] = existingInvestment;
     }
+
+    // function distributeRewards() external onlyOwner {
+    //     uint256 totalShares = getTotalSharesSold();
+    //     for (uint256 i = 0; i < allShareHolders.length; i++) {
+    //         address userAddress = allShareHolders[i];
+    //         uint256 atlasSharesBought = userInvestments[userAddress][
+    //             NODE_TYPE.ATLAS
+    //         ].numberOfShares;
+    //         uint256 strongSharesBought = userInvestments[userAddress][
+    //             NODE_TYPE.STRONGBLOCK
+    //         ].numberOfShares;
+    //         uint256 userSharesPercent = (atlasSharesBought +
+    //             strongSharesBought) / totalShares;
+    //     }
+    // }
 
     function claimRewardByType(NODE_TYPE _nodeType)
         external
