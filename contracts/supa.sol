@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -14,9 +16,9 @@ contract Supa is Ownable {
     address payable public investmentVault; // address where user funds after fees will go to. ($10 per share, usdc)
     address payable public rewardsVault; // address where user rewards will be moved to initially before being claiming.
 
-    address public paymentTokenAddress; // contract address of coins like usdc or whatever we decide the user should buy the shares using.
+    address public paymentTokenAddress;
 
-    uint8 feePercent;
+    uint8 feePercent = 5;
     bool isContractLocked = true;
 
     constructor(
@@ -54,7 +56,8 @@ contract Supa is Ownable {
         uint256 claimableRewards;
     }
 
-    // Note: string below should refer to ATLAS or STRONGBLOCK
+    // Note: NODE_TYPE below should refer to ATLAS (0) or STRONGBLOCK (1).
+    // Enums are uint and will start with 0 by default so ATLAS vaule will be 0 and strongblock will be 1.
     mapping(address => mapping(NODE_TYPE => Investment)) public userInvestments;
 
     address[] public allShareHolders;
@@ -70,10 +73,23 @@ contract Supa is Ownable {
         require(
             (feeAddress != investmentVault &&
                 feeAddress != rewardsVault &&
-                feeAddress != adminAddress),
+                feeAddress != adminAddress &&
+                feeAddress != address(0)),
             "Can't be any of admin, rewards or investment addresses"
         );
         feesVault = payable(feeAddress);
+    }
+
+    function setAdminAddress(address adminWallet) external onlyOwner {
+        require(adminAddress != adminWallet, "same address provided");
+        require(
+            (adminWallet != rewardsVault &&
+                adminWallet != feesVault &&
+                adminWallet != investmentVault &&
+                adminWallet != address(0)),
+            "Can't be any of admin, rewards or investment addresses"
+        );
+        adminAddress = adminWallet;
     }
 
     function setInvestmentVault(address investmentAddress) external onlyOwner {
@@ -81,7 +97,8 @@ contract Supa is Ownable {
         require(
             (investmentAddress != rewardsVault &&
                 investmentAddress != feesVault &&
-                investmentAddress != adminAddress),
+                investmentAddress != adminAddress &&
+                investmentAddress != address(0)),
             "Can't be any of admin, rewards or investment addresses"
         );
         investmentVault = payable(investmentAddress);
@@ -92,7 +109,8 @@ contract Supa is Ownable {
         require(
             (rewardsAddress != investmentVault &&
                 rewardsAddress != feesVault &&
-                rewardsAddress != adminAddress),
+                rewardsAddress != adminAddress &&
+                rewardsAddress != address(0)),
             "Can't be any of admin, rewards or investment addresses"
         );
         rewardsVault = payable(rewardsAddress);
@@ -102,10 +120,17 @@ contract Supa is Ownable {
         external
         onlyOwner
     {
+        require(
+            _tokenAddress != address(0) &&
+                _tokenAddress != adminAddress &&
+                _tokenAddress != feesVault &&
+                _tokenAddress != rewardsVault,
+            "Need a stable coin contract address"
+        );
         paymentTokenAddress = _tokenAddress;
     }
 
-    function _updateInvestmentWallets(address _account) external onlyOwner {
+    function _addNewToInvestmentWallets(address _account) external onlyOwner {
         if (
             _account != address(0) &&
             _account != feesVault &&
@@ -219,18 +244,32 @@ contract Supa is Ownable {
             userInvestments[_account][NODE_TYPE.STRONGBLOCK].claimableRewards;
     }
 
-    function getTotalSharesSold() public view returns (uint256) {
-        uint256 totalShares = 0;
+    function getTotalAtlasSharesBoughtByAll() public view returns (uint256) {
+        uint256 totalAtlasShares = 0;
         for (uint256 i = 0; i < allShareHolders.length; i++) {
             uint256 atlasSharesBought = userInvestments[allShareHolders[i]][
                 NODE_TYPE.ATLAS
             ].numberOfShares;
+            totalAtlasShares += atlasSharesBought;
+        }
+        return totalAtlasShares;
+    }
+
+    function getTotalStrongSharesBoughtByAll() public view returns (uint256) {
+        uint256 totalStrongShares = 0;
+        for (uint256 i = 0; i < allShareHolders.length; i++) {
             uint256 strongSharesBought = userInvestments[allShareHolders[i]][
                 NODE_TYPE.STRONGBLOCK
             ].numberOfShares;
-            totalShares = atlasSharesBought + strongSharesBought;
+            totalStrongShares += strongSharesBought;
         }
-        return totalShares;
+        return totalStrongShares;
+    }
+
+    function getTotalSharesBoughtByAll() public view returns (uint256) {
+        return
+            getTotalAtlasSharesBoughtByAll() +
+            getTotalStrongSharesBoughtByAll();
     }
 
     function createInvestment(NODE_TYPE _nodePreference, uint256 _shares)
@@ -256,7 +295,7 @@ contract Supa is Ownable {
         IERC20(paymentTokenAddress).safeTransferFrom(
             _account,
             investmentVault,
-            10 * _shares
+            10000000000000000000 * _shares // 10 ** 18 wei  is equal to 1 eth - use https://eth-converter.com/
         );
 
         if (existingInvestment.numberOfShares > 0) {
@@ -293,20 +332,36 @@ contract Supa is Ownable {
         userInvestments[_account][_nodePreference] = existingInvestment;
     }
 
-    // function distributeRewards() external onlyOwner {
-    //     uint256 totalShares = getTotalSharesSold();
-    //     for (uint256 i = 0; i < allShareHolders.length; i++) {
-    //         address userAddress = allShareHolders[i];
-    //         uint256 atlasSharesBought = userInvestments[userAddress][
-    //             NODE_TYPE.ATLAS
-    //         ].numberOfShares;
-    //         uint256 strongSharesBought = userInvestments[userAddress][
-    //             NODE_TYPE.STRONGBLOCK
-    //         ].numberOfShares;
-    //         uint256 userSharesPercent = (atlasSharesBought +
-    //             strongSharesBought) / totalShares;
-    //     }
-    // }
+    function distributeRewards() external onlyOwner {
+        uint256 totalAtlasShares = getTotalAtlasSharesBoughtByAll();
+        uint256 totalStrongShares = getTotalStrongSharesBoughtByAll();
+        uint256 balanceInRewardsVault = IERC20(paymentTokenAddress).balanceOf(
+            rewardsVault
+        );
+        for (uint256 i = 0; i < allShareHolders.length; i++) {
+            address userAddress = allShareHolders[i];
+            uint256 atlasSharesBoughtByUser = userInvestments[userAddress][
+                NODE_TYPE.ATLAS
+            ].numberOfShares;
+            uint256 userAtlasSharesPercent = atlasSharesBoughtByUser
+                .div(totalAtlasShares)
+                .mul(100);
+            userInvestments[userAddress][NODE_TYPE.ATLAS].claimableRewards =
+                userAtlasSharesPercent *
+                balanceInRewardsVault;
+            // Now for strong nodes
+            uint256 strongSharesBoughtByUser = userInvestments[userAddress][
+                NODE_TYPE.STRONGBLOCK
+            ].numberOfShares;
+            uint256 userStrongSharesPercent = strongSharesBoughtByUser
+                .div(totalStrongShares)
+                .mul(100);
+            userInvestments[userAddress][NODE_TYPE.STRONGBLOCK]
+                .claimableRewards =
+                userStrongSharesPercent *
+                balanceInRewardsVault;
+        }
+    }
 
     function claimRewardByType(NODE_TYPE _nodeType)
         external
@@ -319,7 +374,19 @@ contract Supa is Ownable {
         ];
         uint256 claimableRewards = existingInvestment.claimableRewards;
         require(claimableRewards > 1, "Not enough rewards to claim!");
-        // Todo: transfer rewards to msg.sender
+        uint256 feeChargedFromRewards = claimableRewards.mul(5).div(100);
+        uint256 rewardsClaimableAfterFee = claimableRewards -
+            feeChargedFromRewards;
+        IERC20(paymentTokenAddress).safeTransferFrom(
+            rewardsVault,
+            feesVault,
+            feeChargedFromRewards.mul(1000000000000000000) // in wei
+        );
+        IERC20(paymentTokenAddress).safeTransferFrom(
+            rewardsVault,
+            _account,
+            rewardsClaimableAfterFee.mul(1000000000000000000) // in wei
+        );
         existingInvestment.claimableRewards = 0;
         // Todo:  check whether we need to do these below again. Check during testing.
         userInvestments[_account][_nodeType] = existingInvestment;
@@ -336,7 +403,19 @@ contract Supa is Ownable {
         uint256 claimableRewards = atlasInvestment.claimableRewards +
             strongInvestment.claimableRewards;
         require(claimableRewards > 1, "Not enough rewards to claim!");
-        // Todo: transfer rewards to msg.sender
+        uint256 feeChargedFromRewards = claimableRewards.mul(5).div(100);
+        uint256 rewardsClaimableAfterFee = claimableRewards -
+            feeChargedFromRewards;
+        IERC20(paymentTokenAddress).safeTransferFrom(
+            rewardsVault,
+            feesVault,
+            feeChargedFromRewards.mul(1000000000000000000) // in wei
+        );
+        IERC20(paymentTokenAddress).safeTransferFrom(
+            rewardsVault,
+            _account,
+            rewardsClaimableAfterFee.mul(1000000000000000000) // in wei
+        );
         atlasInvestment.claimableRewards = 0;
         strongInvestment.claimableRewards = 0;
         // Todo:  check whether we need to do these below again. Check during testing.
